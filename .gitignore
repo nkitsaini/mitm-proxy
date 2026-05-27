@@ -1,0 +1,11 @@
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+.python-version.local
+dist/
+build/
+*.egg-info/
+
+# default data dir for captures
+mitm-data/
