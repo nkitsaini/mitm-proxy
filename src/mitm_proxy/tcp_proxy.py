@@ -350,12 +350,18 @@ async def _forward_content_length(
         if not chunk:
             raise ProtocolError("EOF before Content-Length body fully read")
         writer.write(chunk)
-        if tee is not None:
-            await tee.write(chunk)
         sent += len(chunk)
         remaining -= len(chunk)
+        # IMPORTANT: report progress *before* any awaitable below. The body
+        # pump task can be cancelled by the response-head watcher if upstream
+        # produces a final response before we finish forwarding; cancellation
+        # only takes effect at await points, so anything between writer.write
+        # (which has already queued the bytes to upstream) and the next await
+        # is the safe window to update the running counter.
         if on_progress is not None:
             on_progress(sent)
+        if tee is not None:
+            await tee.write(chunk)
         await writer.drain()
     return length
 
@@ -404,12 +410,16 @@ async def _forward_chunked(
             if not chunk:
                 raise ProtocolError("EOF mid chunk payload")
             writer.write(chunk)
-            if tee is not None:
-                await tee.write(chunk)
             decoded += len(chunk)
             remaining -= len(chunk)
+            # Report progress before the next await -- see the equivalent note
+            # in _forward_content_length. Cancellation can hit at tee.write,
+            # and we must already have recorded the bytes we just queued to
+            # upstream.
             if on_progress is not None:
                 on_progress(decoded)
+            if tee is not None:
+                await tee.write(chunk)
         crlf = await _read_exact(reader, 2, timeout=timeout)
         if crlf != b"\r\n":
             raise ProtocolError("Missing CRLF after chunk")
@@ -675,18 +685,26 @@ class TCPProxy:
         close_after_response = False
 
         async def _fail(exc: BaseException) -> None:
-            # Abort both sides so we don't deliver a half-finished response that
-            # the client might interpret as a successful short body.
-            _safe_abort(cw)
-            _safe_abort(uw)
+            # Persist the failure *before* tearing the connections down. The
+            # client is blocked on us until we abort; doing the DB write first
+            # guarantees an observer who sees the abort (RST/FIN) also sees
+            # the row's error column populated. Reversing this order opens a
+            # short but real race: client unblocks -> reads DB -> we then
+            # await storage.fail. Tests trip this regularly.
             end = time.time()
-            await self.storage.fail(
-                row_id,
-                end_ts=end,
-                duration_ms=(end - start_ts) * 1000.0,
-                request_body_size=body_size_ref[0],
-                error=f"{type(exc).__name__}: {exc}",
-            )
+            try:
+                await self.storage.fail(
+                    row_id,
+                    end_ts=end,
+                    duration_ms=(end - start_ts) * 1000.0,
+                    request_body_size=body_size_ref[0],
+                    error=f"{type(exc).__name__}: {exc}",
+                )
+            finally:
+                # Abort both sides so we don't deliver a half-finished response
+                # that the client might interpret as a successful short body.
+                _safe_abort(cw)
+                _safe_abort(uw)
 
         # ---------------- forward request head ----------------
         try:
