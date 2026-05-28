@@ -37,6 +37,8 @@ def _data_dir_option(f):
         default=str(DEFAULT_DATA_DIR),
         type=click.Path(file_okay=False, path_type=Path),
         show_default=True,
+        envvar="MITM_DATA_DIR",
+        show_envvar=True,
         help="Directory containing captures.db and bodies/ subfolder.",
     )(f)
 
@@ -110,11 +112,47 @@ def main() -> None:
     is_flag=True,
     help="Disable TLS certificate verification when calling upstream.",
 )
+@click.option(
+    "--tcp",
+    is_flag=True,
+    help=(
+        "Use the raw asyncio TCP proxy (byte-faithful: preserves Content-Length, "
+        "reason phrase, Upgrade, trailers, 1xx interim responses; no header injection). "
+        "Default is the aiohttp-based proxy."
+    ),
+)
 @_data_dir_option
-def serve(host: str, port: int, upstream: str, insecure_upstream: bool, data_dir: Path) -> None:
+def serve(
+    host: str,
+    port: int,
+    upstream: str,
+    insecure_upstream: bool,
+    tcp: bool,
+    data_dir: Path,
+) -> None:
     """Start the forwarding proxy."""
     data_dir = data_dir.expanduser().resolve()
     data_dir.mkdir(parents=True, exist_ok=True)
+
+    if tcp:
+        from .tcp_proxy import run as run_tcp
+
+        click.echo(f"[mitm-proxy] (tcp) listening on http://{host}:{port}  ->  {upstream}")
+        click.echo(f"[mitm-proxy] capturing to {data_dir}")
+        try:
+            asyncio.run(
+                run_tcp(
+                    host=host,
+                    port=port,
+                    upstream=upstream,
+                    verify_tls=not insecure_upstream,
+                    data_dir=data_dir,
+                )
+            )
+        except KeyboardInterrupt:
+            pass
+        return
+
     storage = Storage(data_dir / "captures.db")
     proxy = Proxy(
         upstream=upstream,
