@@ -64,11 +64,12 @@ Behavioural notes
 from __future__ import annotations
 
 import asyncio
+import socket
 import ssl as ssl_lib
 import time
 import uuid
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 from urllib.parse import urlsplit
 
 import aiofiles
@@ -224,32 +225,36 @@ def _wants_close(headers: list[tuple[bytes, bytes]], version: bytes) -> bool:
 # =========================================================== stream helpers
 
 
-async def _read_head(reader: asyncio.StreamReader) -> bytes:
+async def _read_head(
+    reader: asyncio.StreamReader, *, timeout: float = IDLE_READ_TIMEOUT
+) -> bytes:
     """Read up to (but not including) the CRLFCRLF terminator of an HTTP message head."""
     try:
-        data = await asyncio.wait_for(
-            reader.readuntil(b"\r\n\r\n"), timeout=IDLE_READ_TIMEOUT
-        )
+        data = await asyncio.wait_for(reader.readuntil(b"\r\n\r\n"), timeout=timeout)
     except asyncio.LimitOverrunError as e:
         raise ProtocolError(f"Header block exceeds {STREAM_LIMIT} bytes") from e
     return data[:-4]
 
 
-async def _read_line(reader: asyncio.StreamReader) -> bytes:
+async def _read_line(
+    reader: asyncio.StreamReader, *, timeout: float = IDLE_READ_TIMEOUT
+) -> bytes:
     try:
-        return await asyncio.wait_for(
-            reader.readuntil(b"\r\n"), timeout=IDLE_READ_TIMEOUT
-        )
+        return await asyncio.wait_for(reader.readuntil(b"\r\n"), timeout=timeout)
     except asyncio.LimitOverrunError as e:
         raise ProtocolError(f"Line exceeds {STREAM_LIMIT} bytes") from e
 
 
-async def _read_exact(reader: asyncio.StreamReader, n: int) -> bytes:
-    return await asyncio.wait_for(reader.readexactly(n), timeout=IDLE_READ_TIMEOUT)
+async def _read_exact(
+    reader: asyncio.StreamReader, n: int, *, timeout: float = IDLE_READ_TIMEOUT
+) -> bytes:
+    return await asyncio.wait_for(reader.readexactly(n), timeout=timeout)
 
 
-async def _read_some(reader: asyncio.StreamReader, n: int) -> bytes:
-    return await asyncio.wait_for(reader.read(n), timeout=IDLE_READ_TIMEOUT)
+async def _read_some(
+    reader: asyncio.StreamReader, n: int, *, timeout: float = IDLE_READ_TIMEOUT
+) -> bytes:
+    return await asyncio.wait_for(reader.read(n), timeout=timeout)
 
 
 def _safe_close(writer: asyncio.StreamWriter) -> None:
@@ -257,6 +262,69 @@ def _safe_close(writer: asyncio.StreamWriter) -> None:
         writer.close()
     except Exception:
         pass
+
+
+def _safe_abort(writer: Optional[asyncio.StreamWriter]) -> None:
+    """Abort the underlying transport (drop pending writes, close immediately).
+
+    Used on error paths so the peer doesn't mistake a truncated stream for a
+    successful, short response. Note: asyncio's ``abort()`` schedules an
+    immediate close but doesn't guarantee a TCP RST -- the kernel still sends
+    FIN unless ``SO_LINGER=(1, 0)`` is set. The behavioral win is that any
+    bytes we hadn't yet flushed are dropped, so we don't deliver a
+    half-finished response.
+    """
+    if writer is None:
+        return
+    try:
+        writer.transport.abort()
+    except Exception:  # noqa: BLE001 - abort in error paths must never raise
+        pass
+
+
+def _configure_socket(writer: asyncio.StreamWriter) -> None:
+    """Apply TCP options we want on every connection leg.
+
+    * ``TCP_NODELAY``: disable Nagle so small writes (size lines, chunked
+      framing, SSE events) aren't held in the kernel for up to 200 ms.
+    * ``SO_KEEPALIVE``: let the kernel detect a silently-dead peer (router
+      eviction, half-open connection) on its own. Doesn't traverse the proxy
+      -- each leg independently watches its own peer.
+    """
+    sock = writer.get_extra_info("socket")
+    if sock is None:
+        return
+    if sock.family not in (socket.AF_INET, socket.AF_INET6):
+        return
+    try:
+        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+    except (OSError, AttributeError):
+        pass
+    try:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+    except (OSError, AttributeError):
+        pass
+
+
+def _add_xff_header(
+    headers: list[tuple[bytes, bytes]], client_ip: str
+) -> list[tuple[bytes, bytes]]:
+    """Append ``client_ip`` to the ``X-Forwarded-For`` header, extending an
+    existing one if present. Returns a new list; does not mutate input."""
+    if not client_ip:
+        return headers
+    ip_bytes = client_ip.encode("ascii")
+    out: list[tuple[bytes, bytes]] = []
+    extended = False
+    for n, v in headers:
+        if not extended and n.lower() == b"x-forwarded-for":
+            out.append((n, v + b", " + ip_bytes))
+            extended = True
+        else:
+            out.append((n, v))
+    if not extended:
+        out.append((b"X-Forwarded-For", ip_bytes))
+    return out
 
 
 # =========================================================== body forwarding
@@ -271,16 +339,23 @@ async def _forward_content_length(
     writer: asyncio.StreamWriter,
     tee: BodyTee,
     length: int,
+    *,
+    timeout: float = IDLE_READ_TIMEOUT,
+    on_progress: Optional[Callable[[int], None]] = None,
 ) -> int:
     remaining = length
+    sent = 0
     while remaining > 0:
-        chunk = await _read_some(reader, min(CHUNK_SIZE, remaining))
+        chunk = await _read_some(reader, min(CHUNK_SIZE, remaining), timeout=timeout)
         if not chunk:
             raise ProtocolError("EOF before Content-Length body fully read")
         writer.write(chunk)
         if tee is not None:
             await tee.write(chunk)
+        sent += len(chunk)
         remaining -= len(chunk)
+        if on_progress is not None:
+            on_progress(sent)
         await writer.drain()
     return length
 
@@ -289,6 +364,9 @@ async def _forward_chunked(
     reader: asyncio.StreamReader,
     writer: asyncio.StreamWriter,
     tee: BodyTee,
+    *,
+    timeout: float = IDLE_READ_TIMEOUT,
+    on_progress: Optional[Callable[[int], None]] = None,
 ) -> int:
     """Forward a Transfer-Encoding: chunked body verbatim.
 
@@ -301,7 +379,7 @@ async def _forward_chunked(
     """
     decoded = 0
     while True:
-        size_line = await _read_line(reader)
+        size_line = await _read_line(reader, timeout=timeout)
         writer.write(size_line)
         size_hex = size_line[:-2].split(b";", 1)[0].strip()
         try:
@@ -311,9 +389,8 @@ async def _forward_chunked(
         if chunk_size < 0:
             raise ProtocolError(f"Negative chunk size: {chunk_size}")
         if chunk_size == 0:
-            # Optional trailer header block, terminated by a bare CRLF.
             while True:
-                line = await _read_line(reader)
+                line = await _read_line(reader, timeout=timeout)
                 writer.write(line)
                 if line == b"\r\n":
                     break
@@ -321,7 +398,9 @@ async def _forward_chunked(
             return decoded
         remaining = chunk_size
         while remaining > 0:
-            chunk = await _read_some(reader, min(CHUNK_SIZE, remaining))
+            chunk = await _read_some(
+                reader, min(CHUNK_SIZE, remaining), timeout=timeout
+            )
             if not chunk:
                 raise ProtocolError("EOF mid chunk payload")
             writer.write(chunk)
@@ -329,7 +408,9 @@ async def _forward_chunked(
                 await tee.write(chunk)
             decoded += len(chunk)
             remaining -= len(chunk)
-        crlf = await _read_exact(reader, 2)
+            if on_progress is not None:
+                on_progress(decoded)
+        crlf = await _read_exact(reader, 2, timeout=timeout)
         if crlf != b"\r\n":
             raise ProtocolError("Missing CRLF after chunk")
         writer.write(crlf)
@@ -340,13 +421,15 @@ async def _forward_until_close(
     reader: asyncio.StreamReader,
     writer: asyncio.StreamWriter,
     tee: BodyTee,
+    *,
+    timeout: float = IDLE_READ_TIMEOUT,
 ) -> int:
     """Read from reader until EOF, forward all bytes. Used for close-delimited
     responses (no Content-Length, no Transfer-Encoding). Forces connection close
     after, since the message boundary is the connection boundary."""
     total = 0
     while True:
-        chunk = await _read_some(reader, CHUNK_SIZE)
+        chunk = await _read_some(reader, CHUNK_SIZE, timeout=timeout)
         if not chunk:
             return total
         writer.write(chunk)
@@ -361,6 +444,8 @@ async def _splice(
     a_writer: asyncio.StreamWriter,
     b_reader: asyncio.StreamReader,
     b_writer: asyncio.StreamWriter,
+    *,
+    timeout: float = IDLE_READ_TIMEOUT,
 ) -> None:
     """Bidirectional raw byte forwarding between two endpoints.
 
@@ -372,7 +457,7 @@ async def _splice(
     async def pump(src: asyncio.StreamReader, dst: asyncio.StreamWriter) -> None:
         try:
             while True:
-                data = await _read_some(src, CHUNK_SIZE)
+                data = await _read_some(src, CHUNK_SIZE, timeout=timeout)
                 if not data:
                     break
                 dst.write(data)
@@ -405,6 +490,9 @@ class TCPProxy:
         storage: Storage,
         bodies_dir: Path,
         verify_tls: bool = True,
+        add_xff: bool = False,
+        idle_read_timeout: float = IDLE_READ_TIMEOUT,
+        upstream_connect_timeout: float = UPSTREAM_CONNECT_TIMEOUT,
     ) -> None:
         parsed = urlsplit(upstream)
         if parsed.scheme not in ("http", "https"):
@@ -429,6 +517,9 @@ class TCPProxy:
         self.bodies_dir = Path(bodies_dir)
         self.bodies_dir.mkdir(parents=True, exist_ok=True)
         self.verify_tls = verify_tls
+        self.add_xff = add_xff
+        self.idle_read_timeout = idle_read_timeout
+        self.upstream_connect_timeout = upstream_connect_timeout
         if parsed.scheme == "https":
             self.ssl_ctx: Optional[ssl_lib.SSLContext] = ssl_lib.create_default_context()
             if not verify_tls:
@@ -436,6 +527,14 @@ class TCPProxy:
                 self.ssl_ctx.verify_mode = ssl_lib.CERT_NONE
         else:
             self.ssl_ctx = None
+
+        # Test/introspection hook: called once per accepted connection-pair,
+        # after both sockets have been opened and TCP options configured.
+        # Receives (client_socket, upstream_socket). Use to assert socket state
+        # in tests; don't rely on it in production code.
+        self.on_connection_setup: Optional[
+            Callable[[socket.socket, socket.socket], None]
+        ] = None
 
     # ------------------------------------------------------------ entry point
 
@@ -460,10 +559,26 @@ class TCPProxy:
                         ),
                         limit=STREAM_LIMIT,
                     ),
-                    timeout=UPSTREAM_CONNECT_TIMEOUT,
+                    timeout=self.upstream_connect_timeout,
                 )
             except (OSError, asyncio.TimeoutError, ssl_lib.SSLError):
                 return
+
+            # Tune both legs: NODELAY for small-write latency, KEEPALIVE for
+            # silent-peer detection. Direct client->upstream connections
+            # typically have these on; without setting them here, going through
+            # the proxy quietly changes wire timing.
+            _configure_socket(client_writer)
+            _configure_socket(upstream_writer)
+            if self.on_connection_setup is not None:
+                cs = client_writer.get_extra_info("socket")
+                us = upstream_writer.get_extra_info("socket")
+                if cs is not None and us is not None:
+                    try:
+                        self.on_connection_setup(cs, us)
+                    except Exception:  # noqa: BLE001 - test hook errors must not crash the proxy
+                        pass
+
             while True:
                 keep_alive = await self._serve_one(
                     client_ip,
@@ -496,7 +611,7 @@ class TCPProxy:
         """
         # ---------------- parse client's request head ----------------
         try:
-            req_head_bytes = await _read_head(cr)
+            req_head_bytes = await _read_head(cr, timeout=self.idle_read_timeout)
         except (asyncio.IncompleteReadError, ConnectionError, asyncio.TimeoutError, OSError):
             return False
         except ProtocolError:
@@ -524,12 +639,14 @@ class TCPProxy:
         req_cl = _find_header(req_headers, b"Content-Length")
         req_chunked = _has_token(req_te, b"chunked")
         req_has_body = req_chunked or (req_cl is not None and req_cl.strip() != b"0")
-        expect_continue = _has_token(
-            _find_header(req_headers, b"Expect"), b"100-continue"
-        )
 
-        # The single mutation: rewrite the Host header value for upstream.
+        # The single mutation that's always applied: rewrite the Host value.
         rewritten_headers = _rewrite_host(req_headers, self.upstream_host_header)
+        # Optional: append/extend X-Forwarded-For so upstream can recover the
+        # original client IP. Off by default to keep the "upstream sees what
+        # client sent" contract; enable with TCPProxy(add_xff=True).
+        if self.add_xff:
+            rewritten_headers = _add_xff_header(rewritten_headers, client_ip)
 
         request_url_str = (
             f"http://{orig_host.decode('latin-1', errors='replace')}{target_str}"
@@ -551,16 +668,23 @@ class TCPProxy:
             request_body_path=req_body_name if req_has_body else None,
         )
 
-        request_body_size = 0
+        # Mutable so the body-pump task can publish progress out to the row's
+        # finalize/fail accounting (which lives in the enclosing scope).
+        body_size_ref: list[int] = [0]
         response_body_size = 0
+        close_after_response = False
 
         async def _fail(exc: BaseException) -> None:
+            # Abort both sides so we don't deliver a half-finished response that
+            # the client might interpret as a successful short body.
+            _safe_abort(cw)
+            _safe_abort(uw)
             end = time.time()
             await self.storage.fail(
                 row_id,
                 end_ts=end,
                 duration_ms=(end - start_ts) * 1000.0,
-                request_body_size=request_body_size,
+                request_body_size=body_size_ref[0],
                 error=f"{type(exc).__name__}: {exc}",
             )
 
@@ -572,67 +696,112 @@ class TCPProxy:
             await _fail(e)
             return False
 
-        # ---------------- Expect: 100-continue dance ----------------
-        # If the client is waiting for an interim response before sending its
-        # body, drain upstream first so we don't deadlock. If upstream answers
-        # with anything other than 100, that becomes the final response and we
-        # skip body forwarding.
-        early_final: Optional[tuple[bytes, list[tuple[bytes, bytes]], int]] = None
-        if expect_continue:
+        # ---------------- concurrent: body upload + response head watcher ----
+        # A direct (no-proxy) client/upstream connection lets upstream emit 1xx
+        # interim responses (100 Continue, 103 Early Hints) at *any* time -- in
+        # particular while the client is still uploading its body, or in response
+        # to Expect: 100-continue *before* any body arrives.
+        #
+        # To preserve that behavior we run the request-body pump and the
+        # response-head watcher as concurrent tasks. The watcher forwards every
+        # 1xx response to the client as it arrives, and only returns when a
+        # final response head (non-1xx, or 101) is received. This also subsumes
+        # the Expect: 100-continue case: the body pump blocks reading from the
+        # client until the watcher forwards the 100 (which the client was
+        # waiting on), at which point the client begins sending the body and
+        # the pump unblocks naturally.
+        #
+        # If upstream produces a final response *before* the body finishes
+        # uploading (e.g. 417 Expectation Failed, or a fast 4xx based on
+        # headers alone), we cancel the body pump and mark the upstream
+        # connection as unsafe to reuse (the incomplete request body remains
+        # in upstream's read buffer).
+
+        def _on_body_progress(n: int) -> None:
+            body_size_ref[0] = n
+
+        async def _body_pump() -> None:
+            if not req_has_body:
+                return
+            async with aiofiles.open(req_body_path, "wb") as tee:
+                if req_chunked:
+                    await _forward_chunked(
+                        cr, uw, tee,
+                        timeout=self.idle_read_timeout,
+                        on_progress=_on_body_progress,
+                    )
+                else:
+                    length = _parse_int(req_cl)
+                    if length < 0:
+                        raise ProtocolError(f"Negative Content-Length: {length}")
+                    await _forward_content_length(
+                        cr, uw, tee, length,
+                        timeout=self.idle_read_timeout,
+                        on_progress=_on_body_progress,
+                    )
+
+        body_task = asyncio.create_task(_body_pump())
+        resp_task = asyncio.create_task(self._forward_response_head(ur, cw))
+
+        _STREAM_ERRS: tuple[type[BaseException], ...] = (
+            ProtocolError,
+            ConnectionError,
+            OSError,
+            asyncio.TimeoutError,
+            asyncio.IncompleteReadError,
+        )
+
+        async def _drain(t: asyncio.Task) -> None:
+            if not t.done():
+                t.cancel()
             try:
-                early_final = await self._forward_until_continue_or_final(ur, cw)
-            except (
-                ProtocolError,
-                ConnectionError,
-                OSError,
-                asyncio.TimeoutError,
-                asyncio.IncompleteReadError,
-            ) as e:
-                await _fail(e)
+                await t
+            except BaseException:  # noqa: BLE001 - errors already handled / irrelevant after cancel
+                pass
+
+        try:
+            done, _pending = await asyncio.wait(
+                [body_task, resp_task],
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+        except asyncio.CancelledError:
+            await _drain(body_task)
+            await _drain(resp_task)
+            raise
+
+        # The response watcher committing -- with or without error -- determines
+        # this request's outcome. If it's still running, the body must have
+        # completed; we wait for the response next.
+        if resp_task not in done:
+            # Only the body pump finished. If it errored we abandon the request;
+            # otherwise we wait for the response head.
+            if body_task.exception() is not None:
+                await _drain(resp_task)
+                await _fail(body_task.exception())
                 return False
-
-        if early_final is None:
-            # ---------------- forward request body ----------------
-            if req_has_body:
-                try:
-                    async with aiofiles.open(req_body_path, "wb") as tee:
-                        if req_chunked:
-                            request_body_size = await _forward_chunked(cr, uw, tee)
-                        else:
-                            length = _parse_int(req_cl)
-                            if length < 0:
-                                raise ProtocolError(
-                                    f"Negative Content-Length: {length}"
-                                )
-                            request_body_size = await _forward_content_length(
-                                cr, uw, tee, length
-                            )
-                except (
-                    ProtocolError,
-                    ConnectionError,
-                    OSError,
-                    asyncio.TimeoutError,
-                    asyncio.IncompleteReadError,
-                ) as e:
-                    await _fail(e)
-                    return False
-
-            # ---------------- read & forward response head(s) ----------------
             try:
-                resp_start, resp_headers, status_code = await self._forward_response_head(
-                    ur, cw
-                )
-            except (
-                ProtocolError,
-                ConnectionError,
-                OSError,
-                asyncio.TimeoutError,
-                asyncio.IncompleteReadError,
-            ) as e:
+                await resp_task
+            except _STREAM_ERRS as e:
                 await _fail(e)
                 return False
         else:
-            resp_start, resp_headers, status_code = early_final
+            # Response watcher completed first (or simultaneously). Stop the
+            # body pump if it's still running -- upstream has already decided.
+            if not body_task.done():
+                await _drain(body_task)
+                # Upstream's read buffer has a partial request; conn is unsafe
+                # to reuse for another request.
+                close_after_response = True
+            elif body_task.exception() is not None:
+                # Body finished and errored, but we have a response anyway.
+                # Conn unsafe to reuse.
+                close_after_response = True
+
+        if resp_task.exception() is not None:
+            await _fail(resp_task.exception())
+            return False
+
+        resp_start, resp_headers, status_code = resp_task.result()
 
         # ---------------- 101 Switching Protocols -> raw tunnel ----------------
         if status_code == 101:
@@ -641,13 +810,13 @@ class TCPProxy:
                 row_id,
                 end_ts=end,
                 duration_ms=(end - start_ts) * 1000.0,
-                request_body_size=request_body_size,
+                request_body_size=body_size_ref[0],
                 status_code=status_code,
                 response_headers=_decode_for_storage(resp_headers),
                 response_body_path=None,
                 response_body_size=0,
             )
-            await _splice(cr, cw, ur, uw)
+            await _splice(cr, cw, ur, uw, timeout=self.idle_read_timeout)
             return False
 
         # ---------------- forward response body ----------------
@@ -656,7 +825,6 @@ class TCPProxy:
             or 100 <= status_code < 200
             or status_code in (204, 304)
         )
-        close_after_response = False
         if not no_body:
             resp_te = _find_header(resp_headers, b"Transfer-Encoding")
             resp_cl = _find_header(resp_headers, b"Content-Length")
@@ -664,18 +832,22 @@ class TCPProxy:
             try:
                 async with aiofiles.open(resp_body_path, "wb") as tee:
                     if resp_chunked:
-                        response_body_size = await _forward_chunked(ur, cw, tee)
+                        response_body_size = await _forward_chunked(
+                            ur, cw, tee, timeout=self.idle_read_timeout
+                        )
                     elif resp_cl is not None:
                         length = _parse_int(resp_cl)
                         if length < 0:
                             raise ProtocolError(f"Negative Content-Length: {length}")
                         if length > 0:
                             response_body_size = await _forward_content_length(
-                                ur, cw, tee, length
+                                ur, cw, tee, length, timeout=self.idle_read_timeout
                             )
                     else:
                         # No framing headers: HTTP/1.0-style close-delimited body.
-                        response_body_size = await _forward_until_close(ur, cw, tee)
+                        response_body_size = await _forward_until_close(
+                            ur, cw, tee, timeout=self.idle_read_timeout
+                        )
                         close_after_response = True
             except (
                 ProtocolError,
@@ -692,7 +864,7 @@ class TCPProxy:
             row_id,
             end_ts=end,
             duration_ms=(end - start_ts) * 1000.0,
-            request_body_size=request_body_size,
+            request_body_size=body_size_ref[0],
             status_code=status_code,
             response_headers=_decode_for_storage(resp_headers),
             response_body_path=resp_body_name if (not no_body) else None,
@@ -709,27 +881,6 @@ class TCPProxy:
 
     # ------------------------------------------------------------ helpers
 
-    async def _forward_until_continue_or_final(
-        self,
-        ur: asyncio.StreamReader,
-        cw: asyncio.StreamWriter,
-    ) -> Optional[tuple[bytes, list[tuple[bytes, bytes]], int]]:
-        """Drain interim responses from upstream until we see either a 100
-        Continue (return None; the caller proceeds to forward the request body)
-        or a final response that pre-empts the body (return it).
-        """
-        while True:
-            head_bytes = await _read_head(ur)
-            start, headers = _parse_header_block(head_bytes)
-            _, status, _ = _parse_status_line(start)
-            cw.write(_serialize_head(start, headers))
-            await cw.drain()
-            if status == 100:
-                return None
-            if 100 <= status < 200 and status != 101:
-                continue
-            return (start, headers, status)
-
     async def _forward_response_head(
         self,
         ur: asyncio.StreamReader,
@@ -738,7 +889,7 @@ class TCPProxy:
         """Read response heads, forwarding 1xx interim responses transparently,
         and return the final (non-1xx, or 101) response head."""
         while True:
-            head_bytes = await _read_head(ur)
+            head_bytes = await _read_head(ur, timeout=self.idle_read_timeout)
             start, headers = _parse_header_block(head_bytes)
             _, status, _ = _parse_status_line(start)
             cw.write(_serialize_head(start, headers))
@@ -758,6 +909,9 @@ async def run(
     upstream: str,
     verify_tls: bool,
     data_dir: Path,
+    add_xff: bool = False,
+    idle_read_timeout: float = IDLE_READ_TIMEOUT,
+    upstream_connect_timeout: float = UPSTREAM_CONNECT_TIMEOUT,
 ) -> None:
     """Open storage, start the TCP server, serve forever."""
     storage = Storage(data_dir / "captures.db")
@@ -768,6 +922,9 @@ async def run(
             storage=storage,
             bodies_dir=data_dir / "bodies",
             verify_tls=verify_tls,
+            add_xff=add_xff,
+            idle_read_timeout=idle_read_timeout,
+            upstream_connect_timeout=upstream_connect_timeout,
         )
         server = await asyncio.start_server(
             proxy.handle_connection,

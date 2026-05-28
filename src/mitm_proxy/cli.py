@@ -121,6 +121,33 @@ def main() -> None:
         "Default is the aiohttp-based proxy."
     ),
 )
+@click.option(
+    "--add-xff",
+    is_flag=True,
+    help=(
+        "TCP proxy only. Append the client's IP to X-Forwarded-For so upstream "
+        "can recover the originating address. Off by default since it violates "
+        "the strict 'upstream sees only what client sent' contract."
+    ),
+)
+@click.option(
+    "--idle-read-timeout",
+    type=float,
+    default=600.0,
+    show_default=True,
+    envvar="MITM_IDLE_READ_TIMEOUT",
+    show_envvar=True,
+    help="TCP proxy only. Per-read inactivity timeout, in seconds.",
+)
+@click.option(
+    "--upstream-connect-timeout",
+    type=float,
+    default=30.0,
+    show_default=True,
+    envvar="MITM_UPSTREAM_CONNECT_TIMEOUT",
+    show_envvar=True,
+    help="TCP proxy only. Upstream TCP/TLS handshake timeout, in seconds.",
+)
 @_data_dir_option
 def serve(
     host: str,
@@ -128,6 +155,9 @@ def serve(
     upstream: str,
     insecure_upstream: bool,
     tcp: bool,
+    add_xff: bool,
+    idle_read_timeout: float,
+    upstream_connect_timeout: float,
     data_dir: Path,
 ) -> None:
     """Start the forwarding proxy."""
@@ -138,6 +168,8 @@ def serve(
         from .tcp_proxy import run as run_tcp
 
         click.echo(f"[mitm-proxy] (tcp) listening on http://{host}:{port}  ->  {upstream}")
+        if add_xff:
+            click.echo("[mitm-proxy] injecting X-Forwarded-For header")
         click.echo(f"[mitm-proxy] capturing to {data_dir}")
         try:
             asyncio.run(
@@ -147,6 +179,9 @@ def serve(
                     upstream=upstream,
                     verify_tls=not insecure_upstream,
                     data_dir=data_dir,
+                    add_xff=add_xff,
+                    idle_read_timeout=idle_read_timeout,
+                    upstream_connect_timeout=upstream_connect_timeout,
                 )
             )
         except KeyboardInterrupt:

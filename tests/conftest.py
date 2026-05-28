@@ -233,6 +233,7 @@ class ProxyHandle:
     port: int
     data_dir: Path
     storage: Storage
+    tcp_proxy: TCPProxy
 
 
 # ============================================================ fixtures
@@ -248,10 +249,17 @@ async def fake_upstream():
         await up.stop()
 
 
-@pytest_asyncio.fixture
-async def proxy(tmp_path: Path, fake_upstream: FakeUpstream):
+async def _start_proxy(
+    tmp_path: Path, fake_upstream: FakeUpstream, **proxy_kwargs
+) -> tuple[ProxyHandle, asyncio.AbstractServer]:
+    """Spin up a fresh TCPProxy + storage + server. Returns (handle, server).
+
+    Caller is responsible for closing the server and storage. The ``proxy``
+    fixture wraps this for the common case; tests that need non-default
+    TCPProxy params (XFF, short timeouts, ...) can call this directly.
+    """
     data_dir = tmp_path / "mitm"
-    data_dir.mkdir()
+    data_dir.mkdir(exist_ok=True)
     storage = Storage(data_dir / "captures.db")
     await storage.open()
     tcp_proxy = TCPProxy(
@@ -259,22 +267,40 @@ async def proxy(tmp_path: Path, fake_upstream: FakeUpstream):
         storage=storage,
         bodies_dir=data_dir / "bodies",
         verify_tls=False,
+        **proxy_kwargs,
     )
     server = await asyncio.start_server(
         tcp_proxy.handle_connection, host="127.0.0.1", port=0
     )
     port = server.sockets[0].getsockname()[1]
+    return (
+        ProxyHandle(
+            host="127.0.0.1",
+            port=port,
+            data_dir=data_dir,
+            storage=storage,
+            tcp_proxy=tcp_proxy,
+        ),
+        server,
+    )
+
+
+async def _stop_proxy(handle: ProxyHandle, server: asyncio.AbstractServer) -> None:
+    server.close()
     try:
-        yield ProxyHandle(
-            host="127.0.0.1", port=port, data_dir=data_dir, storage=storage
-        )
+        await asyncio.wait_for(server.wait_closed(), timeout=2.0)
+    except asyncio.TimeoutError:
+        pass
+    await handle.storage.close()
+
+
+@pytest_asyncio.fixture
+async def proxy(tmp_path: Path, fake_upstream: FakeUpstream):
+    handle, server = await _start_proxy(tmp_path, fake_upstream)
+    try:
+        yield handle
     finally:
-        server.close()
-        try:
-            await asyncio.wait_for(server.wait_closed(), timeout=2.0)
-        except asyncio.TimeoutError:
-            pass
-        await storage.close()
+        await _stop_proxy(handle, server)
 
 
 # ============================================================ helpers
