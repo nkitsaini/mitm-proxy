@@ -631,6 +631,59 @@ async def test_100_continue_normal_flow(
     assert row["request_body_size"] == 11
 
 
+async def test_100_continue_final_response_does_not_cancel_upload(
+    proxy: ProxyHandle, fake_upstream: FakeUpstream
+) -> None:
+    """After upstream sends 100, a queued final response must not stop body upload."""
+
+    body_seen: list[bytes] = []
+
+    async def handler(reader, writer, up):
+        await reader.readuntil(b"\r\n\r\n")
+        writer.write(b"HTTP/1.1 100 Continue\r\n\r\n")
+        await writer.drain()
+        writer.write(
+            b"HTTP/1.1 500 Internal Server Error\r\n"
+            b"Content-Length: 0\r\n"
+            b"Connection: close\r\n"
+            b"\r\n"
+        )
+        await writer.drain()
+        try:
+            body_seen.append(await asyncio.wait_for(reader.readexactly(11), timeout=2.0))
+        except (asyncio.IncompleteReadError, asyncio.TimeoutError):
+            body_seen.append(b"")
+
+    fake_upstream.raw_handler = handler
+
+    reader, writer = await asyncio.open_connection(proxy.host, proxy.port)
+    writer.write(
+        b"POST /up HTTP/1.1\r\n"
+        b"Host: orig\r\n"
+        b"Content-Length: 11\r\n"
+        b"Expect: 100-continue\r\n"
+        b"Connection: close\r\n"
+        b"\r\n"
+    )
+    await writer.drain()
+
+    interim = await asyncio.wait_for(reader.readuntil(b"\r\n\r\n"), timeout=5.0)
+    assert interim == b"HTTP/1.1 100 Continue\r\n\r\n"
+
+    writer.write(b"hello world")
+    await writer.drain()
+
+    final = await asyncio.wait_for(reader.read(), timeout=5.0)
+    assert final.startswith(b"HTTP/1.1 500 Internal Server Error\r\n")
+    assert body_seen == [b"hello world"]
+
+    writer.close()
+    try:
+        await asyncio.wait_for(writer.wait_closed(), timeout=2.0)
+    except (asyncio.TimeoutError, ConnectionError, OSError):
+        pass
+
+
 async def test_100_continue_server_rejects(
     proxy: ProxyHandle, fake_upstream: FakeUpstream
 ) -> None:

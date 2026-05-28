@@ -716,24 +716,15 @@ class TCPProxy:
 
         # ---------------- concurrent: body upload + response head watcher ----
         # A direct (no-proxy) client/upstream connection lets upstream emit 1xx
-        # interim responses (100 Continue, 103 Early Hints) at *any* time -- in
-        # particular while the client is still uploading its body, or in response
-        # to Expect: 100-continue *before* any body arrives.
+        # interim responses while the client is uploading. We forward those
+        # interim heads promptly, but treat 100 Continue as a gate: once upstream
+        # has told the client to send the body, the proxy must not race ahead,
+        # read a later final response, and cancel the upload. That changes what
+        # upstream observes after 100 and can hide upstream bugs that depend on
+        # that exact state.
         #
-        # To preserve that behavior we run the request-body pump and the
-        # response-head watcher as concurrent tasks. The watcher forwards every
-        # 1xx response to the client as it arrives, and only returns when a
-        # final response head (non-1xx, or 101) is received. This also subsumes
-        # the Expect: 100-continue case: the body pump blocks reading from the
-        # client until the watcher forwards the 100 (which the client was
-        # waiting on), at which point the client begins sending the body and
-        # the pump unblocks naturally.
-        #
-        # If upstream produces a final response *before* the body finishes
-        # uploading (e.g. 417 Expectation Failed, or a fast 4xx based on
-        # headers alone), we cancel the body pump and mark the upstream
-        # connection as unsafe to reuse (the incomplete request body remains
-        # in upstream's read buffer).
+        # Final responses before any 100 still pre-empt the body, matching
+        # Expect: 100-continue rejection behavior such as 417.
 
         def _on_body_progress(n: int) -> None:
             body_size_ref[0] = n
@@ -759,7 +750,11 @@ class TCPProxy:
                     )
 
         body_task = asyncio.create_task(_body_pump())
-        resp_task = asyncio.create_task(self._forward_response_head(ur, cw))
+        resp_task = asyncio.create_task(
+            self._forward_until_continue_or_final(ur, cw)
+            if req_has_body
+            else self._forward_response_head(ur, cw)
+        )
 
         _STREAM_ERRS: tuple[type[BaseException], ...] = (
             ProtocolError,
@@ -803,23 +798,51 @@ class TCPProxy:
                 await _fail(e)
                 return False
         else:
-            # Response watcher completed first (or simultaneously). Stop the
-            # body pump if it's still running -- upstream has already decided.
-            if not body_task.done():
-                await _drain(body_task)
-                # Upstream's read buffer has a partial request; conn is unsafe
-                # to reuse for another request.
-                close_after_response = True
-            elif body_task.exception() is not None:
-                # Body finished and errored, but we have a response anyway.
-                # Conn unsafe to reuse.
-                close_after_response = True
+            if resp_task.exception() is None and req_has_body and resp_task.result() is None:
+                # Upstream sent 100 Continue. Let the body upload finish before
+                # reading the final response; otherwise the proxy can pre-empt
+                # the upload in a way a direct client/upstream connection would
+                # not.
+                try:
+                    await body_task
+                except _STREAM_ERRS as e:
+                    await _fail(e)
+                    return False
+                try:
+                    resp_task = asyncio.create_task(self._forward_response_head(ur, cw))
+                    await resp_task
+                except _STREAM_ERRS as e:
+                    await _fail(e)
+                    return False
+            else:
+                # Response watcher completed first (or simultaneously) with a
+                # final response. Stop the body pump if it's still running --
+                # upstream has already decided without accepting the body.
+                if not body_task.done():
+                    await _drain(body_task)
+                    # Upstream's read buffer has a partial request; conn is unsafe
+                    # to reuse for another request.
+                    close_after_response = True
+                elif body_task.exception() is not None:
+                    # Body finished and errored, but we have a response anyway.
+                    # Conn unsafe to reuse.
+                    close_after_response = True
 
         if resp_task.exception() is not None:
             await _fail(resp_task.exception())
             return False
 
-        resp_start, resp_headers, status_code = resp_task.result()
+        resp_result = resp_task.result()
+        if resp_result is None:
+            # The body finished before the watcher observed 100 Continue. The
+            # 100 has already been forwarded, so now read the final response.
+            try:
+                resp_result = await self._forward_response_head(ur, cw)
+            except _STREAM_ERRS as e:
+                await _fail(e)
+                return False
+
+        resp_start, resp_headers, status_code = resp_result
 
         # ---------------- 101 Switching Protocols -> raw tunnel ----------------
         if status_code == 101:
@@ -898,6 +921,28 @@ class TCPProxy:
         return True
 
     # ------------------------------------------------------------ helpers
+
+    async def _forward_until_continue_or_final(
+        self,
+        ur: asyncio.StreamReader,
+        cw: asyncio.StreamWriter,
+    ) -> Optional[tuple[bytes, list[tuple[bytes, bytes]], int]]:
+        """Forward interim responses until 100 Continue or a final response.
+
+        ``None`` means upstream sent 100 Continue, so the caller should finish
+        forwarding the request body before reading the final response.
+        """
+        while True:
+            head_bytes = await _read_head(ur, timeout=self.idle_read_timeout)
+            start, headers = _parse_header_block(head_bytes)
+            _, status, _ = _parse_status_line(start)
+            cw.write(_serialize_head(start, headers))
+            await cw.drain()
+            if status == 100:
+                return None
+            if 100 <= status < 200 and status != 101:
+                continue
+            return start, headers, status
 
     async def _forward_response_head(
         self,
